@@ -99,18 +99,33 @@ Date: Thu, 02 Jul 2026 12:00:00 GMT`;
 
 // Compact tool output (remove redundant lines, keep essentials)
 function compactOutput(output: string): string {
-	const lines = output.split('\n');
-	const compacted = lines
-		.filter((line) => {
-			// Remove empty lines and verbose nmap output
-			if (!line.trim()) return false;
-			if (line.includes('Starting Nmap') || line.includes('Nmap scan report') || line.includes('Nmap done')) return true;
-			if (line.includes('PORT') || line.includes('STATE') || line.includes('SERVICE')) return true;
-			if (line.match(/^\d+\/\w+/)) return true; // Port lines
-			return !line.startsWith('|') && !line.startsWith('MAC Address');
-		})
-		.join('\n');
-	return compacted;
+	const lines = output.split('\n').filter((line) => line.trim());
+
+	// For nmap output: keep only port lines and summaries
+	if (output.includes('Nmap scan report')) {
+		return lines
+			.filter((line) => {
+				const trimmed = line.trim();
+				// Keep: port info, state info, service info
+				if (trimmed.match(/^\d+\/\w+/)) return true; // "22/tcp   open   ssh"
+				if (trimmed.includes('PORT') || trimmed.includes('STATE') || trimmed.includes('SERVICE')) return true;
+				if (trimmed.includes('Nmap scan report') || trimmed.includes('Host is up')) return true;
+				// Skip: empty lines, verbose metadata
+				return false;
+			})
+			.join('\n');
+	}
+
+	// For other output: keep first 50 lines max
+	return lines.slice(0, 50).join('\n');
+}
+
+// Summarize compacted output into key facts (for storage and analysis)
+function summarizeOutput(compactedOutput: string, dataType: string): string {
+	// This will be called by the Summarization Agent
+	// For now, just return the compacted output
+	// The AI agent will handle the actual summarization
+	return compactedOutput;
 }
 
 // Process tool calls for RECON AGENT
@@ -140,13 +155,13 @@ function processAnalysisToolCall(toolName: string): string {
 
 // RECON AGENT: Gathers data and saves to notes
 async function runReconAgent(target: string): Promise<void> {
-	const reconPrompt = `You are a reconnaissance specialist. Your ONLY job is to gather data about the target: ${target}
+	const reconPrompt = `You are a reconnaissance specialist. Your ONLY job is to gather raw data about the target: ${target}
 
 Instructions:
 1. Use available tools to gather data (port scan, HTTP headers)
 2. Focus on FACTS and OBSERVATIONS only - no analysis yet
-3. Compact your output - remove redundant lines
-4. Be concise but complete
+3. Output should be concise but complete
+4. Do not interpret or analyze - just gather
 
 Gather comprehensive reconnaissance data now.`;
 
@@ -161,18 +176,18 @@ Gather comprehensive reconnaissance data now.`;
 
 	// Process tool calls in loop
 	while (response.stop_reason === 'tool_use') {
-		// Add the assistant response
 		messages.push({ role: 'assistant', content: response.content });
 
-		// Process ALL tool calls in this response
 		const toolResults: Anthropic.ToolResultBlockParam[] = [];
-		
+
 		for (const block of response.content) {
 			if (block.type === 'tool_use') {
-				const toolResult = processReconToolCall(
+				let toolResult = processReconToolCall(
 					block.name,
 					block.input as Record<string, unknown>
 				);
+				// Compact the output immediately
+				toolResult = compactOutput(toolResult);
 				toolResults.push({
 					type: 'tool_result',
 					tool_use_id: block.id,
@@ -181,7 +196,6 @@ Gather comprehensive reconnaissance data now.`;
 			}
 		}
 
-		// Add all tool results in one user message
 		if (toolResults.length > 0) {
 			messages.push({
 				role: 'user',
@@ -197,8 +211,8 @@ Gather comprehensive reconnaissance data now.`;
 		});
 	}
 
-	// Extract recon findings
-	const reconFindings = response.content
+	// Extract raw findings
+	const rawFindings = response.content
 		.filter((block) => block.type === 'text')
 		.map((block) => (block as Anthropic.TextBlock).text)
 		.join('\n');
@@ -207,8 +221,8 @@ Gather comprehensive reconnaissance data now.`;
 	const notes = `# Reconnaissance Notes for ${target}
 Generated: ${new Date().toISOString()}
 
-## Raw Findings
-${reconFindings}
+## Raw Findings (Compacted)
+${rawFindings}
 
 ---
 `;
@@ -217,71 +231,72 @@ ${reconFindings}
 	console.log(`Recon notes saved to ${notesFile}`);
 }
 
-// ANALYSIS AGENT: Reads notes and writes report
-async function runAnalysisAgent(): Promise<string> {
-	const analysisPrompt = `You are a security analyst. Your ONLY job is to analyze reconnaissance data and provide actionable insights.
+// SUMMARIZATION AGENT: Compresses raw findings into key facts
+async function runSummarizationAgent(): Promise<string> {
+	// Read the notes file
+	const notesContent = fs.existsSync(notesFile) 
+		? fs.readFileSync(notesFile, 'utf-8') 
+		: 'No reconnaissance notes found.';
 
-Instructions:
-1. Read the reconnaissance notes using the read_recon_notes tool
-2. Analyze the findings for security implications
-3. Provide:
-   - Summary of discovered services
-   - Potential vulnerabilities
-   - Recommended next steps
-4. Be concise and security-focused
-5. Note any gaps or limitations in the data`;
+	const summarizePrompt = `You are a data summarizer. Read the reconnaissance notes and compress them into a concise summary.
 
-	const messages: Anthropic.MessageParam[] = [{ role: 'user', content: analysisPrompt }];
+RECONNAISSANCE NOTES:
+${notesContent}
 
-	let response = await client.messages.create({
+Your output should be:
+- One sentence per discovered service
+- One sentence per potential vulnerability category
+- A list of all open ports
+- Keep it under 150 words
+
+Be precise and skip redundant information.`;
+
+	const messages: Anthropic.MessageParam[] = [
+		{
+			role: 'user',
+			content: summarizePrompt,
+		},
+	];
+
+	const response = await client.messages.create({
 		model: 'claude-haiku-4-5-20251001',
-		max_tokens: 2048,
-		tools: analysisTools,
+		max_tokens: 512,
 		messages: messages,
 	});
 
-	// Process tool calls in loop
-	while (response.stop_reason === 'tool_use') {
-		// Add the assistant response
-		messages.push({ role: 'assistant', content: response.content });
-
-		// Process ALL tool calls in this response
-		const toolResults: Anthropic.ToolResultBlockParam[] = [];
-		
-		for (const block of response.content) {
-			if (block.type === 'tool_use') {
-				const toolResult = processAnalysisToolCall(block.name);
-				toolResults.push({
-					type: 'tool_result',
-					tool_use_id: block.id,
-					content: toolResult,
-				});
-			}
-		}
-
-		// Add all tool results in one user message
-		if (toolResults.length > 0) {
-			messages.push({
-				role: 'user',
-				content: toolResults,
-			});
-		}
-
-		response = await client.messages.create({
-			model: 'claude-haiku-4-5-20251001',
-			max_tokens: 2048,
-			tools: analysisTools,
-			messages: messages,
-		});
-	}
-
-	// Extract analysis report
-	const report = response.content
+	return response.content
 		.filter((block) => block.type === 'text')
 		.map((block) => (block as Anthropic.TextBlock).text)
 		.join('\n');
+}
 
-	return report;
+// ANALYSIS AGENT: Reads notes and writes detailed report
+async function runAnalysisAgent(summary: string): Promise<string> {
+	const analysisPrompt = `You are a security analyst. Your job is to analyze reconnaissance data and provide actionable security insights.
+
+Summary of reconnaissance:
+${summary}
+
+Provide:
+1. Summary of discovered services
+2. Potential vulnerabilities ranked by severity
+3. Recommended next steps
+4. Data gaps and limitations
+
+Be concise and security-focused.`;
+
+	const messages: Anthropic.MessageParam[] = [{ role: 'user', content: analysisPrompt }];
+
+	const response = await client.messages.create({
+		model: 'claude-haiku-4-5-20251001',
+		max_tokens: 2048,
+		messages: messages,
+	});
+
+	return response.content
+		.filter((block) => block.type === 'text')
+		.map((block) => (block as Anthropic.TextBlock).text)
+		.join('\n');
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -317,16 +332,22 @@ export function activate(context: vscode.ExtensionContext) {
 
 			// Run RECON AGENT
 			await runReconAgent(target);
-			vscode.window.showInformationMessage('✅ Reconnaissance complete. Running analysis...');
+			vscode.window.showInformationMessage('✅ Recon complete. Summarizing findings...');
+
+			// Run SUMMARIZATION AGENT
+			const summary = await runSummarizationAgent();
+			vscode.window.showInformationMessage('✅ Summarization complete. Analyzing...');
 
 			// Run ANALYSIS AGENT
-			const report = await runAnalysisAgent();
+			const report = await runAnalysisAgent(summary);
 
 			// Display final report
 			const outputChannel = vscode.window.createOutputChannel('Recon Copilot');
 			outputChannel.clear();
 			outputChannel.appendLine(`=== Security Analysis Report for ${target} ===\n`);
 			outputChannel.appendLine(report);
+			outputChannel.appendLine(`\n---\n`);
+			outputChannel.appendLine(`📋 Summary used for analysis:\n${summary}`);
 			outputChannel.show();
 
 			vscode.window.showInformationMessage('✅ Analysis complete! Check the output panel.');
