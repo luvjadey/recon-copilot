@@ -112,16 +112,33 @@ function portScan(target: string, ports?: string): string {
 	}
 }
 
-// Fetch HTTP headers, in this project it is simulated
-function fetchHttpHeaders(url: string): string {
-	return `HTTP/1.1 200 OK
-Server: Apache/2.4.41
-Content-Type: text/html; charset=UTF-8
-Content-Length: 1234
-Cache-Control: max-age=3600
-X-Powered-By: PHP/7.4.3
-Set-Cookie: session=abc123; Path=/
-Date: Thu, 02 Jul 2026 12:00:00 GMT`;
+// Fetch HTTP headers from a live target
+async function fetchHttpHeaders(url: string): Promise<string> {
+	// Default to http:// if no scheme is provided
+	const targetUrl = /^https?:\/\//i.test(url) ? url : `http://${url}`;
+
+	try {
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), 15000);
+
+		const response = await fetch(targetUrl, {
+			method: 'HEAD',
+			redirect: 'manual',
+			signal: controller.signal,
+		});
+		clearTimeout(timeout);
+
+		const statusLine = `HTTP ${response.status} ${response.statusText}`.trim();
+		const headerLines: string[] = [];
+		response.headers.forEach((value, name) => {
+			headerLines.push(`${name}: ${value}`);
+		});
+
+		return [statusLine, ...headerLines].join('\n');
+	} catch (error) {
+		const errorMessage = error instanceof Error ? error.message : String(error);
+		return `Error fetching HTTP headers from ${targetUrl}: ${errorMessage}`;
+	}
 }
 
 // Compact tool output
@@ -144,7 +161,7 @@ function compactOutput(output: string): string {
 }
 
 // Process tool calls for RECON AGENT (1)
-function processReconToolCall(toolName: string, toolInput: Record<string, unknown>): string {
+async function processReconToolCall(toolName: string, toolInput: Record<string, unknown>): Promise<string> {
 	if (toolName === 'port_scan') {
 		const target = toolInput.target as string;
 		const ports = toolInput.ports as string | undefined;
@@ -152,7 +169,7 @@ function processReconToolCall(toolName: string, toolInput: Record<string, unknow
 		return compactOutput(output);
 	} else if (toolName === 'fetch_http_headers') {
 		const url = toolInput.url as string;
-		return fetchHttpHeaders(url);
+		return await fetchHttpHeaders(url);
 	}
 	return 'Unknown tool';
 }
@@ -207,7 +224,7 @@ Gather comprehensive reconnaissance data now.`;
 
 		for (const block of response.content) {
 			if (block.type === 'tool_use') {
-				let toolResult = processReconToolCall(
+				let toolResult = await processReconToolCall(
 					block.name,
 					block.input as Record<string, unknown>
 				);
@@ -366,7 +383,7 @@ Format it as a markdown document. Be concise and security-focused.`;
 export function activate(context: vscode.ExtensionContext) {
 	console.log('Recon Copilot activated!');
 
-	const disposable = vscode.commands.registerCommand('recon-copilot.helloWorld', async () => {
+	const disposable = vscode.commands.registerCommand('recon-copilot.scan', async () => {
 		try {
 			const target = await vscode.window.showInputBox({
 				prompt: ' Enter target to scan (e.g., scanme.nmap.org, 127.0.0.1)',

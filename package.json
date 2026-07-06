@@ -14,8 +14,8 @@
   "contributes": {
     "commands": [
       {
-        "command": "recon-copilot.helloWorld",
-        "title": "Hello World"
+        "command": "recon-copilot.scan",
+        "title": "Recon Copilot: Scan Target"
       }
     ]
   },
